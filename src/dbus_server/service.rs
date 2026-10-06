@@ -564,6 +564,7 @@ mod tests {
             _collection_id: &str,
             _secret_id: &str,
             _can_prompt: bool,
+            _caller_terminal: Option<&crate::caller_terminal::CallerTerminal>,
         ) -> Result<Vec<u8>> {
             unimplemented!()
         }

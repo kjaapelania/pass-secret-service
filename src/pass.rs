@@ -15,7 +15,10 @@ use tokio::{
     process::Command,
 };
 
-use crate::error::{Error, Result};
+use crate::{
+    caller_terminal::CallerTerminal,
+    error::{Error, Result},
+};
 
 #[derive(Debug)]
 pub struct PasswordStore {
@@ -99,7 +102,12 @@ impl PasswordStore {
     }
 
     /// Read a single password at the given path
-    pub async fn read_password(&self, path: impl AsRef<Path>, can_prompt: bool) -> Result<Vec<u8>> {
+    pub async fn read_password(
+        &self,
+        path: impl AsRef<Path>,
+        can_prompt: bool,
+        caller_terminal: Option<&CallerTerminal>,
+    ) -> Result<Vec<u8>> {
         let contents = read(self.get_full_secret_path(path)).await?;
 
         let mut command = self.make_gpg_process();
@@ -107,6 +115,8 @@ impl PasswordStore {
         if !can_prompt {
             // don't activate pinentry if we can't prompt
             command.arg("--pinentry-mode=error");
+        } else if let Some(caller) = caller_terminal {
+            caller.apply_to_command(&mut command);
         }
 
         command.arg("--decrypt").arg("-");

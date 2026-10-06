@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use dyn_clone::DynClone;
 
-use crate::{error::Result, pass::PasswordStore};
+use crate::{caller_terminal::CallerTerminal, error::Result, pass::PasswordStore};
 
 pub mod redb;
 mod redb_imps;
@@ -88,6 +88,7 @@ pub trait SecretStore<'a>: Debug + DynClone {
         collection_id: &str,
         secret_id: &str,
         can_prompt: bool,
+        caller_terminal: Option<&CallerTerminal>,
     ) -> Result<Vec<u8>>;
     async fn read_secret_attrs(
         &self,

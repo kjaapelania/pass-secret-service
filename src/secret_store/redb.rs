@@ -8,6 +8,7 @@ use redb::{
 use tokio::{sync::RwLock, task::spawn_blocking};
 
 use crate::{
+    caller_terminal::CallerTerminal,
     error::{raise_nonexistent_table, IntoResult, OptionNoneNotFound, Result},
     pass::PasswordStore,
     secret_store::{redb_imps::RedbHashMap, slugify, SecretStore, NANOID_ALPHABET, PASS_SUBDIR},
@@ -473,10 +474,14 @@ impl<'a> SecretStore<'a> for RedbSecretStore<'a> {
         collection_id: &str,
         secret_id: &str,
         can_prompt: bool,
+        caller_terminal: Option<&CallerTerminal>,
     ) -> Result<Vec<u8>> {
         let secret_path = Path::new(PASS_SUBDIR).join(collection_id).join(secret_id);
 
-        Ok(self.pass.read_password(secret_path, can_prompt).await?)
+        Ok(self
+            .pass
+            .read_password(secret_path, can_prompt, caller_terminal)
+            .await?)
     }
 
     /// read the attributes for the given secret
@@ -929,5 +934,54 @@ mod tests {
                     .any(|matches| matches)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_secret_roundtrip_with_and_without_caller_terminal() {
+        let gpg_home = MockGpgHome::new().await;
+        let password_store_dir = gpg_home.temp_path().join("password-store");
+        fs::create_dir(&password_store_dir).await.unwrap();
+        fs::write(password_store_dir.join(".gpg-id"), RECIPIENT)
+            .await
+            .unwrap();
+
+        let pass = PasswordStore::for_test(password_store_dir.clone(), gpg_home.path());
+        let store = RedbSecretStore::new(&pass).await.unwrap();
+        let collection_id = Arc::new(
+            store
+                .create_collection(Some("test-read".into()), None)
+                .await
+                .unwrap(),
+        );
+        let secret_payload = b"super-secret-token".to_vec();
+        let secret_id = Arc::new(
+            store
+                .create_secret(
+                    collection_id.clone(),
+                    Some("token".into()),
+                    secret_payload.clone(),
+                    Arc::new(HashMap::new()),
+                )
+                .await
+                .unwrap(),
+        );
+
+        // 1. Read without caller terminal (as before)
+        let read_val = store
+            .read_secret(&collection_id, &secret_id, true, None)
+            .await
+            .unwrap();
+        assert_eq!(read_val, secret_payload);
+
+        // 2. Read with caller terminal
+        let terminal = CallerTerminal {
+            tty: "/dev/null".to_string(),
+            term: Some("xterm-256color".to_string()),
+        };
+        let read_val_with_term = store
+            .read_secret(&collection_id, &secret_id, true, Some(&terminal))
+            .await
+            .unwrap();
+        assert_eq!(read_val_with_term, secret_payload);
     }
 }

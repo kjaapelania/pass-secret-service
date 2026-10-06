@@ -18,6 +18,7 @@ use crate::{
     error::Result,
 };
 
+mod caller_terminal;
 mod cli;
 mod dbus_server;
 mod error;

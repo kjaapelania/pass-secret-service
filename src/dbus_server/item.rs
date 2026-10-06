@@ -16,6 +16,7 @@ use zbus::{
 };
 
 use crate::{
+    caller_terminal::CallerTerminal,
     dbus_server::collection::Collection,
     error::{Error, Result},
     secret_store::SecretStore,
@@ -141,17 +142,33 @@ impl<'a> Item<'a> {
                 .unwrap_or_else(|| "[unknown ID]".into())
         );
 
-        let secret_value = self
-            .store
-            .read_secret(&*self.collection_id, &*self.id, true)
-            .await?;
-
-        // update fetch access info
+        // fetch access info first so we can identify caller terminal if available
         let access_info = if let Some(id) = header.sender() {
             Some(SecretAccessor::from_dbus_name(connection, id).await?)
         } else {
             None
         };
+
+        let caller_terminal = if let Some(accessor) = access_info.as_ref() {
+            let pid = accessor.pid;
+            let uid = accessor.uid;
+            spawn_blocking(move || CallerTerminal::from_caller(pid, uid))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let secret_value = self
+            .store
+            .read_secret(
+                &*self.collection_id,
+                &*self.id,
+                true,
+                caller_terminal.as_ref(),
+            )
+            .await?;
 
         // send desktop notification if enabled
         if self.notify_on_access {
