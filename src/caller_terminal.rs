@@ -20,72 +20,28 @@ impl CallerTerminal {
         let current_uid = unsafe { libc::getuid() };
         if uid != current_uid {
             debug!(
-                "Caller UID {} does not match current UID {}; running gpg as before",
-                uid, current_uid
+                "Caller UID {uid} does not match current UID {current_uid}; running gpg as before"
             );
             return None;
         }
 
-        let env = get_process_environ(pid);
-        let gpg_tty_env = env.get("GPG_TTY").filter(|s| !s.trim().is_empty()).cloned();
-        let term = env.get("TERM").filter(|s| !s.trim().is_empty()).cloned();
+        let mut env = get_process_environ(pid);
+        let term = env.remove("TERM");
+        let tty = env
+            .remove("GPG_TTY")
+            .filter(|p| is_terminal_path(Path::new(p)))
+            .or_else(|| find_caller_fd_terminal(pid))?;
 
-        let terminal = resolve_terminal_with(
-            gpg_tty_env,
-            |tty| is_terminal_path(Path::new(tty)),
-            || find_caller_fd_terminal(pid),
-        );
-
-        match terminal {
-            Some(tty) => {
-                debug!(
-                    "Found caller terminal: {} (TERM: {:?}) for PID {}",
-                    tty, term, pid
-                );
-                Some(CallerTerminal { tty, term })
-            }
-            None => {
-                debug!("Caller PID {} has no terminal; running gpg as before", pid);
-                None
-            }
-        }
+        debug!("Found caller terminal: {tty} (TERM: {term:?}) for PID {pid}");
+        Some(CallerTerminal { tty, term })
     }
 
     /// Hands this terminal to the gpg command.
     pub fn apply_to_command(&self, command: &mut Command) {
         command.env("GPG_TTY", &self.tty);
-        command.arg("--ttyname").arg(&self.tty);
         if let Some(term) = &self.term {
             command.env("TERM", term);
-            command.arg("--ttytype").arg(term);
         }
-    }
-}
-
-/// Resolves the terminal path according to the precedence rules:
-/// 1. If GPG_TTY is set in the environment and refers to a terminal, use it.
-/// 2. Otherwise, fall back to checking the caller's file descriptors.
-pub fn resolve_terminal_with<F, G>(
-    gpg_tty_env: Option<String>,
-    is_terminal: F,
-    find_fd_terminal: G,
-) -> Option<String>
-where
-    F: Fn(&str) -> bool,
-    G: FnOnce() -> Option<String>,
-{
-    if let Some(gpg_tty) = gpg_tty_env {
-        if is_terminal(&gpg_tty) {
-            Some(gpg_tty)
-        } else {
-            debug!(
-                "Caller GPG_TTY ({}) is not a valid terminal; falling back to stdin/stdout/stderr",
-                gpg_tty
-            );
-            find_fd_terminal()
-        }
-    } else {
-        find_fd_terminal()
     }
 }
 
@@ -97,56 +53,36 @@ pub fn is_terminal_path(path: &Path) -> bool {
 
     let path_str = path.to_string_lossy();
 
-    // Must match standard pseudo-terminal (PTS) or virtual console naming,
-    // and explicitly avoid serial ports like ttyS* or ttyUSB*.
+    // Must match standard pseudo-terminal (PTS) or virtual console naming.
+    // Explicitly rejects /dev/tty itself (which refers to pinentry's own controlling
+    // terminal rather than the caller's) and serial ports like ttyS* or ttyUSB*.
     let is_terminal_name = path_str.starts_with("/dev/pts/")
-        || path_str == "/dev/tty"
-        || path_str.starts_with("/dev/ttys")
-        || (path_str.starts_with("/dev/tty")
-            && !path_str.starts_with("/dev/ttyS")
-            && !path_str.starts_with("/dev/ttyUSB"));
+        || path_str
+            .strip_prefix("/dev/tty")
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
 
     if !is_terminal_name {
         return false;
     }
 
     // Inspect inode metadata (stat) without opening the device file
-    if let Ok(meta) = std::fs::metadata(path) {
-        meta.file_type().is_char_device()
-    } else {
-        false
-    }
-}
-
-/// Helper that checks fds 0, 1, 2 in order and returns the first terminal found.
-pub fn find_fd_terminal_with<F>(mut check_fd: F) -> Option<String>
-where
-    F: FnMut(i32) -> Option<String>,
-{
-    for fd in [0, 1, 2] {
-        if let Some(term) = check_fd(fd) {
-            return Some(term);
-        }
-    }
-    None
+    std::fs::metadata(path)
+        .map(|meta| meta.file_type().is_char_device())
+        .unwrap_or(false)
 }
 
 /// Checks stdin (0), stdout (1), and stderr (2) of the given PID in order
 /// and returns the path to the first one that is a terminal.
 pub fn find_caller_fd_terminal(pid: u32) -> Option<String> {
-    find_fd_terminal_with(|fd| {
-        let proc_fd_path_str = format!("/proc/{pid}/fd/{fd}");
-        let proc_fd_path = Path::new(&proc_fd_path_str);
-
-        if let Ok(target) = std::fs::read_link(proc_fd_path) {
-            if is_terminal_path(&target) || is_terminal_path(proc_fd_path) {
+    for fd in [0, 1, 2] {
+        let proc_fd_path = format!("/proc/{pid}/fd/{fd}");
+        if let Ok(target) = std::fs::read_link(&proc_fd_path) {
+            if is_terminal_path(&target) {
                 return Some(target.to_string_lossy().into_owned());
             }
-        } else if is_terminal_path(proc_fd_path) {
-            return Some(proc_fd_path_str);
         }
-        None
-    })
+    }
+    None
 }
 
 /// Parses null-delimited KEY=VALUE environment bytes from procfs into a HashMap.
@@ -165,11 +101,9 @@ pub fn parse_environ_bytes(bytes: &[u8]) -> HashMap<String, String> {
 /// Reads the environment of a process from `/proc/{pid}/environ`.
 pub fn get_process_environ(pid: u32) -> HashMap<String, String> {
     let proc_path = format!("/proc/{pid}/environ");
-    if let Ok(bytes) = std::fs::read(&proc_path) {
-        parse_environ_bytes(&bytes)
-    } else {
-        HashMap::new()
-    }
+    std::fs::read(proc_path)
+        .map(|bytes| parse_environ_bytes(&bytes))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -185,13 +119,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_terminal_path_non_terminal() {
+    fn test_is_terminal_path_validation() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         assert!(!is_terminal_path(temp.path()));
         assert!(!is_terminal_path(Path::new("/dev/null")));
         assert!(!is_terminal_path(Path::new("/nonexistent/path/for/sure")));
-        assert!(!is_terminal_path(Path::new("/dev/ttyS0")));
-        assert!(!is_terminal_path(Path::new("/dev/ttyUSB0")));
+        assert!(!is_terminal_path(Path::new("/dev/tty"))); // Rejects /dev/tty itself
+        assert!(!is_terminal_path(Path::new("/dev/ttyS0"))); // Rejects serial ports
+        assert!(!is_terminal_path(Path::new("/dev/ttyUSB0"))); // Rejects serial ports
     }
 
     #[test]
@@ -203,17 +138,7 @@ mod tests {
         let mut cmd = Command::new("gpg");
         caller.apply_to_command(&mut cmd);
 
-        // Verify command has been configured
         let std_cmd = cmd.as_std();
-        let args: Vec<String> = std_cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.contains(&"--ttyname".to_string()));
-        assert!(args.contains(&"/dev/pts/42".to_string()));
-        assert!(args.contains(&"--ttytype".to_string()));
-        assert!(args.contains(&"xterm-256color".to_string()));
-
         let envs: Vec<(String, Option<String>)> = std_cmd
             .get_envs()
             .map(|(k, v)| {
@@ -237,13 +162,6 @@ mod tests {
         caller.apply_to_command(&mut cmd);
 
         let std_cmd = cmd.as_std();
-        let args: Vec<String> = std_cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.contains(&"--ttyname".to_string()));
-        assert!(!args.contains(&"--ttytype".to_string()));
-
         let envs: Vec<(String, Option<String>)> = std_cmd
             .get_envs()
             .map(|(k, v)| {
@@ -266,92 +184,5 @@ mod tests {
         assert_eq!(env.get("HOME"), Some(&"/home/user".to_string()));
         assert_eq!(env.get("EMPTY"), Some(&"".to_string()));
         assert_eq!(env.get("INVALID_ENTRY"), None);
-    }
-
-    #[test]
-    fn test_resolve_terminal_with_valid_gpg_tty() {
-        let resolved = resolve_terminal_with(
-            Some("/dev/pts/2".to_string()),
-            |path| path == "/dev/pts/2",
-            || panic!("Should not check fds when GPG_TTY is valid"),
-        );
-        assert_eq!(resolved, Some("/dev/pts/2".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_terminal_with_invalid_gpg_tty_falls_back() {
-        let resolved = resolve_terminal_with(
-            Some("/dev/stale_pts".to_string()),
-            |_path| false, // Not a terminal
-            || Some("/dev/pts/fallback".to_string()),
-        );
-        assert_eq!(resolved, Some("/dev/pts/fallback".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_terminal_without_gpg_tty_uses_fallback() {
-        let resolved = resolve_terminal_with(
-            None,
-            |_path| true,
-            || Some("/dev/pts/from_stdin".to_string()),
-        );
-        assert_eq!(resolved, Some("/dev/pts/from_stdin".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_terminal_no_terminal_anywhere() {
-        let resolved = resolve_terminal_with(None, |_path| false, || None);
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn test_find_fd_terminal_order() {
-        // 1. Stdin (0) is terminal: returns stdin, doesn't evaluate stdout or stderr
-        let mut checked = Vec::new();
-        let res = find_fd_terminal_with(|fd| {
-            checked.push(fd);
-            if fd == 0 {
-                Some("/dev/pts/stdin".to_string())
-            } else {
-                Some("/dev/pts/other".to_string())
-            }
-        });
-        assert_eq!(res, Some("/dev/pts/stdin".to_string()));
-        assert_eq!(checked, vec![0]);
-
-        // 2. Stdin (0) is redirected, stdout (1) is terminal
-        checked.clear();
-        let res = find_fd_terminal_with(|fd| {
-            checked.push(fd);
-            if fd == 1 {
-                Some("/dev/pts/stdout".to_string())
-            } else {
-                None
-            }
-        });
-        assert_eq!(res, Some("/dev/pts/stdout".to_string()));
-        assert_eq!(checked, vec![0, 1]);
-
-        // 3. Stdin (0) and stdout (1) are redirected, stderr (2) is terminal
-        checked.clear();
-        let res = find_fd_terminal_with(|fd| {
-            checked.push(fd);
-            if fd == 2 {
-                Some("/dev/pts/stderr".to_string())
-            } else {
-                None
-            }
-        });
-        assert_eq!(res, Some("/dev/pts/stderr".to_string()));
-        assert_eq!(checked, vec![0, 1, 2]);
-
-        // 4. None of 0, 1, 2 are terminals
-        checked.clear();
-        let res = find_fd_terminal_with(|fd| {
-            checked.push(fd);
-            None
-        });
-        assert_eq!(res, None);
-        assert_eq!(checked, vec![0, 1, 2]);
     }
 }
