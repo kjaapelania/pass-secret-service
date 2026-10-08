@@ -90,32 +90,29 @@ where
 }
 
 /// Checks whether a given path refers to an active terminal device.
+/// Uses `stat(2)` metadata rather than `open(2)` to avoid driver side effects
+/// on hardware serial ports.
 pub fn is_terminal_path(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
 
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    let path_str = path.to_string_lossy();
+
+    // Must match standard pseudo-terminal (PTS) or virtual console naming,
+    // and explicitly avoid serial ports like ttyS* or ttyUSB*.
+    let is_terminal_name = path_str.starts_with("/dev/pts/")
+        || path_str == "/dev/tty"
+        || path_str.starts_with("/dev/ttys")
+        || (path_str.starts_with("/dev/tty")
+            && !path_str.starts_with("/dev/ttyS")
+            && !path_str.starts_with("/dev/ttyUSB"));
+
+    if !is_terminal_name {
         return false;
-    };
-
-    let mut fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
-        )
-    };
-    if fd < 0 {
-        fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
-            )
-        };
     }
 
-    if fd >= 0 {
-        let is_tty = unsafe { libc::isatty(fd) } == 1;
-        unsafe { libc::close(fd) };
-        is_tty
+    // Inspect inode metadata (stat) without opening the device file
+    if let Ok(meta) = std::fs::metadata(path) {
+        meta.file_type().is_char_device()
     } else {
         false
     }
@@ -193,6 +190,8 @@ mod tests {
         assert!(!is_terminal_path(temp.path()));
         assert!(!is_terminal_path(Path::new("/dev/null")));
         assert!(!is_terminal_path(Path::new("/nonexistent/path/for/sure")));
+        assert!(!is_terminal_path(Path::new("/dev/ttyS0")));
+        assert!(!is_terminal_path(Path::new("/dev/ttyUSB0")));
     }
 
     #[test]
