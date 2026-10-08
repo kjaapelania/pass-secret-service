@@ -1,6 +1,5 @@
 use log::debug;
 use std::{collections::HashMap, path::Path};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,24 +150,6 @@ pub fn find_caller_fd_terminal(pid: u32) -> Option<String> {
         }
         None
     })
-    .or_else(|| {
-        #[cfg(unix)]
-        if pid == std::process::id() {
-            return find_fd_terminal_with(|fd| {
-                if unsafe { libc::isatty(fd) } == 1 {
-                    let ptr = unsafe { libc::ttyname(fd) };
-                    if !ptr.is_null() {
-                        let c_str = unsafe { std::ffi::CStr::from_ptr(ptr) };
-                        if let Ok(s) = c_str.to_str() {
-                            return Some(s.to_string());
-                        }
-                    }
-                }
-                None
-            });
-        }
-        None
-    })
 }
 
 /// Parses null-delimited KEY=VALUE environment bytes from procfs into a HashMap.
@@ -184,38 +165,14 @@ pub fn parse_environ_bytes(bytes: &[u8]) -> HashMap<String, String> {
     env
 }
 
-/// Reads the environment of a process.
-/// Tries reading /proc/{pid}/environ first, falling back to sysinfo.
+/// Reads the environment of a process from `/proc/{pid}/environ`.
 pub fn get_process_environ(pid: u32) -> HashMap<String, String> {
-    // 1. Try reading /proc/{pid}/environ (Linux procfs)
     let proc_path = format!("/proc/{pid}/environ");
     if let Ok(bytes) = std::fs::read(&proc_path) {
-        let env = parse_environ_bytes(&bytes);
-        if !env.is_empty() {
-            return env;
-        }
+        parse_environ_bytes(&bytes)
+    } else {
+        HashMap::new()
     }
-
-    // 2. Fall back to sysinfo (e.g. non-Linux or /proc not available)
-    let mut env = HashMap::new();
-    let mut system = System::new();
-    let pid_struct = Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid_struct]),
-        false,
-        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
-    );
-    if let Some(process) = system.process(pid_struct) {
-        for os_str in process.environ() {
-            if let Some(s) = os_str.to_str() {
-                if let Some((k, v)) = s.split_once('=') {
-                    env.insert(k.to_string(), v.to_string());
-                }
-            }
-        }
-    }
-
-    env
 }
 
 #[cfg(test)]
